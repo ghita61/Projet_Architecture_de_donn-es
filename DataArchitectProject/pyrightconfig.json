@@ -1,0 +1,16 @@
+{
+  "extraPaths": [
+    "./scrapers",
+    "./pipelines",
+    "./ingestion",
+    "./governance",
+    "./quality"
+  ],
+  "exclude": [
+    "./airflow/dags"
+  ],
+  "reportMissingImports": "none",
+  "reportAttributeAccessIssue": "none",
+  "reportUnusedExpression": "none",
+  "pythonVersion": "3.12"
+}

@@ -1,0 +1,298 @@
+# ============================================
+# Big Data News Analytics Platform
+# Docker Compose — Main services
+# ============================================
+
+services:
+
+  # --- Zookeeper (Kafka dependency) ---
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - data-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Apache Kafka (message broker for streaming) ---
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - data-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # --- Kafka UI (Visual interface for Kafka) ---
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8081:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    networks:
+      - data-network
+
+  # --- MinIO (S3-compatible Data Lake) ---
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-ghitaaya}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - data-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- MinIO bucket initialisation (runs once on first start) ---
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
+        mc mb --ignore-existing local/bronze;
+        mc mb --ignore-existing local/silver;
+        mc mb --ignore-existing local/gold;
+        mc mb --ignore-existing local/quality-reports;
+        mc mb --ignore-existing local/quarantine;
+        echo 'Buckets created successfully';
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-ghitaaya}
+    networks:
+      - data-network
+
+  # --- PostgreSQL (Data Warehouse) ---
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-warehouse_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ghitaaya}
+      POSTGRES_DB: ${POSTGRES_DB:-news_warehouse}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./warehouse/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - data-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-warehouse_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- PostgreSQL for Airflow metadata (separate database) ---
+  airflow-db:
+    image: postgres:15-alpine
+    container_name: airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ghitaaya
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    networks:
+      - data-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Airflow: initialisation container (runs once) ---
+  airflow-init:
+    image: apache/airflow:2.8.1-python3.11
+    container_name: airflow-init
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:ghitaaya@airflow-db:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: ghitaaya
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create --role Admin --username admin --password ghitaaya --email admin@example.com --firstname Admin --lastname User || true
+    networks:
+      - data-network
+
+  # --- Airflow Webserver (UI on port 8080) ---
+  airflow-webserver:
+    image: apache/airflow:2.8.1-python3.11
+    container_name: airflow-webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-db:
+        condition: service_healthy
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:ghitaaya@airflow-db:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+      _PIP_ADDITIONAL_REQUIREMENTS: "langdetect"
+
+      # Environment variables so DAGs can access MinIO and PostgreSQL
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-ghitaaya}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-news_warehouse}
+      POSTGRES_USER: ${POSTGRES_USER:-warehouse_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ghitaaya}
+      KAFKA_BROKER: kafka:9092
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./scrapers:/opt/airflow/scrapers
+      - ./pipelines:/opt/airflow/pipelines
+      - ./quality:/opt/airflow/quality
+      - ./governance:/opt/airflow/governance
+      - ./ingestion:/opt/airflow/ingestion
+      - airflow_logs:/opt/airflow/logs
+    command: webserver
+    networks:
+      - data-network
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # --- Airflow Scheduler (executes the DAGs) ---
+  airflow-scheduler:
+    image: apache/airflow:2.8.1-python3.11
+    container_name: airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-db:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:ghitaaya@airflow-db:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-ghitaaya}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-news_warehouse}
+      POSTGRES_USER: ${POSTGRES_USER:-warehouse_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ghitaaya}
+      KAFKA_BROKER: kafka:9092
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./scrapers:/opt/airflow/scrapers
+      - ./pipelines:/opt/airflow/pipelines
+      - ./quality:/opt/airflow/quality
+      - ./governance:/opt/airflow/governance
+      - ./ingestion:/opt/airflow/ingestion
+      - airflow_logs:/opt/airflow/logs
+    command: scheduler
+    networks:
+      - data-network
+
+  # --- Apache Superset (dashboard visualisation) ---
+  superset:
+    image: apache/superset:3.1.0
+    container_name: superset
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${SUPERSET_PORT:-8088}:8088"
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-ghitaaya}
+      SUPERSET_LOAD_EXAMPLES: "no"
+    volumes:
+      - superset_data:/app/superset_home
+    networks:
+      - data-network
+    command: >
+      /bin/sh -c "
+        superset db upgrade &&
+        superset fab create-admin --username admin --password ghitaaya --firstname Admin --lastname User --email admin@example.com || true &&
+        superset init &&
+        superset run -h 0.0.0.0 -p 8088 --with-threads
+      "
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+# --- Persistent volumes ---
+volumes:
+  minio_data:
+    driver: local
+  postgres_data:
+    driver: local
+  airflow_db_data:
+    driver: local
+  airflow_logs:
+    driver: local
+  superset_data:
+    driver: local
+
+# --- Internal network ---
+networks:
+  data-network:
+    driver: bridge
+    name: data-network
